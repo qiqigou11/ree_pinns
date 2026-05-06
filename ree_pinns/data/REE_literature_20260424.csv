@@ -1,0 +1,8 @@
+id,filename,author,year,title,journal,parent_rock,has_REE,has_clay,has_pH_CIA,status
+1,Nagasawa2024.pdf,Nagasawa et al.,2024,Interpretation of vertical migration and enrichment processes of REEs in ion-adsorption type deposits,Chemical Geology,weathered granite,yes,no,yes,downloaded
+2,Li2019_EconGeol.pdf,Li M.Y.H. et al.,2019,"The Genesis of Regolith-Hosted Heavy Rare Earth Element Deposits: Insights from the World-Class Zudong Deposit in Jiangxi Province, South China",Economic Geology,A-type granite,yes,yes,yes,downloaded
+3,Li_Zhou_2023.pdf,Li M.Y.H. & Zhou M.F.,2023,Physicochemical variation of clay minerals and enrichment of REEs in regolith-hosted deposits,Clays and Clay Minerals,A-type granite,yes,yes,yes,downloaded
+4,Fu2019_ie.pdf,Fu et al.,2019,Enrichment of ion-exchangeable REEs by felsic volcanic rock weathering in South China,Applied Geochemistry,rhyolite,yes,no,yes,downloaded
+5,Yaraghi2020.pdf,Yaraghi et al.,2020,Comparison of characteristics and geochemical behaviors of REEs in two weathered granitic profiles,Journal of Geochemical Exploration,two-mica granite,yes,no,yes,downloaded
+6,Luo2023.pdf,Luo et al.,2023,Weathering co-mineralization of placer type ilmenite and ion-adsorption type REEs,Ore Geology Reviews,tonalite/diorite/pyroxene diorite,yes,no,yes,downloaded
+7,Wang 等 - 2024 - Enrichment of REEs During Weathering of Alkaline Igneous Systems.pdf,Wang M. et al.,2024,Enrichment of REEs During Weathering of Alkaline Igneous Systems: Insights from Puxiong,Economic Geology,nepheline syenite,yes,no,no,layer_mean
