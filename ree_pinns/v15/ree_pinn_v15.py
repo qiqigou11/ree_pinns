@@ -16,12 +16,12 @@ REE PINN v15 — 完整物理化学框架 + 对流-弥散-吸附分馏模型
         λ ≈ (v/D_eff) · R/2
 
 ### LREE/HREE 分馏：
-    λ_L = λ_base · sqrt(DK)   # LREE 阻滞更强
-    λ_H = λ_base / sqrt(DK)   # HREE 阻滞更弱
+    DK = K_d^L / K_d^H < 1（HREE 吸附更强）
+    λ_H = λ_base / sqrt(DK)   # HREE 吸附更强 → λ_H > λ_base
+    λ_L = λ_base * sqrt(DK)   # LREE 吸附更弱 → λ_L < λ_base
 
-    DK = K_d^L / K_d^H > 1（LREE 吸附更强）
-    → λ_L > λ_H
-    → LREE 更早趋于母岩值
+    → λ_H/λ_L = 1/DK > 1
+    → HREE 更早趋于母岩值
     → L/H 比值在浅层最大，随深度减小
 
 ### 气候/径流作用（通过 λ_base）：
@@ -51,7 +51,7 @@ REE PINN v15 — 完整物理化学框架 + 对流-弥散-吸附分馏模型
     L_data:    实测浓度拟合（双输出：LREE + HREE）
     L_bc:      边界条件（z=0 → C_atm, z=z_max → C_parent）
     L_phys:    稳态 A-D 方程残差（自动微分）
-    L_frac:    分馏约束（λ_L > λ_H，软约束）
+    L_frac:    分馏约束（λ_H > λ_L，软约束）
 
 
 ## 4. 展示目标
@@ -60,6 +60,13 @@ REE PINN v15 — 完整物理化学框架 + 对流-弥散-吸附分馏模型
     B. 物理参数：λ_L, λ_H, DK, bT, bP 学习曲线
     C. 跨剖面对比：所有剖面 L/H-z 叠加
     D. 敏感性分析：给定不同 T/P/R，预测 L/H 曲线（PINN 的外推能力）
+
+================================================================
+v15 修复记录：
+- 修复1: 扩展输入为8维 [z,T,P,R, CL_parent, CH_parent, CL_atm, CH_atm]
+- 修复2: 自动微分除以Z_MAX修正量纲
+- 修复3: 添加 z=z_max 处母岩边界损失
+- 修复4: 修正 DK 打印文本为 λ_H/λ_L = 1/DK
 """
 
 import torch
@@ -84,6 +91,12 @@ T_MEAN, T_STD = 290.62, 3.78
 P_MEAN, P_STD = 1604.84, 710.27
 R_MEAN, R_STD = 0.5210, 0.2310
 
+# 母岩浓度归一化参数（用于新增的4个输入特征）
+CL_PAR_MEAN, CL_PAR_STD = 200.0, 150.0   # LREE母岩浓度均值/标准差
+CH_PAR_MEAN, CH_PAR_STD = 80.0, 60.0     # HREE母岩浓度均值/标准差
+CL_ATM_MEAN, CL_ATM_STD = 100.0, 80.0    # LREE表层浓度均值/标准差
+CH_ATM_MEAN, CH_ATM_STD = 40.0, 30.0     # HREE表层浓度均值/标准差
+
 LREE_COLS = ['La_ppm', 'Ce_ppm', 'Pr_ppm', 'Nd_ppm', 'Sm_ppm']
 HREE_COLS = ['Tb_ppm', 'Dy_ppm', 'Ho_ppm', 'Er_ppm', 'Tm_ppm', 'Yb_ppm', 'Lu_ppm']
 
@@ -91,6 +104,7 @@ HREE_COLS = ['Tb_ppm', 'Dy_ppm', 'Ho_ppm', 'Er_ppm', 'Tm_ppm', 'Yb_ppm', 'Lu_ppm
 # =====================================================================
 # 网络（SIREN）
 # =====================================================================
+# sin激活函数
 class SineLayer(nn.Module):
     def __init__(self, inf, outf, first=False, omega=30):
         super().__init__()
@@ -111,17 +125,19 @@ class REE_PINF(nn.Module):
     """
     物理-informed 网络
 
-    输入：[z_norm, T_norm, P_norm, R_norm]
+    输入：[z_norm, T_norm, P_norm, R_norm, CL_parent_norm, CH_parent_norm, CL_atm_norm, CH_atm_norm]
     输出：[C_LREE, C_HREE] (ppm)
 
     物理约束：
       - C >= 0（Softplus 输出层）
       - C 单调从 C_atm 变到 C_parent
     """
-    def __init__(self, h=64, n=5):
+    def __init__(self, h=16, n=3):
         super().__init__()
+        # 修复1: 输入维度从4扩展到8
+        # 小型网络：h=16隐藏单元，n=3层（约1.3K参数 vs 原来25K）
         self.net = nn.Sequential(
-            SineLayer(4, h, first=True),
+            SineLayer(8, h, first=True),
             *[SineLayer(h, h) for _ in range(n-1)]
         )
         self.head_L = nn.Sequential(
@@ -148,10 +164,12 @@ class PhysicalParams(nn.Module):
 
     λ_base = λ_0 · exp(bT · T_n + bP · P_n + bR · R_n)
 
-    λ_L = λ_base · sqrt(DK)   # LREE
-    λ_H = λ_base / sqrt(DK)  # HREE
+    DK = K_d^L / K_d^H < 1（HREE 吸附更强）
+    λ_H = λ_base / sqrt(DK)   # HREE 吸附更强，衰减更快
+    λ_L = λ_base * sqrt(DK)   # LREE 吸附更弱，衰减更慢
 
-    DK = K_d^L / K_d^H > 1（LREE 吸附更强）
+    → λ_H/λ_L = 1/DK > 1
+
     λ_0: 基准分馏系数（m⁻¹）
     bT, bP, bR: 气候敏感系数
     """
@@ -161,7 +179,7 @@ class PhysicalParams(nn.Module):
         self.bT = nn.Parameter(torch.tensor(0.0))
         self.bP = nn.Parameter(torch.tensor(0.0))
         self.bR = nn.Parameter(torch.tensor(0.0))
-        self.log_DK = nn.Parameter(torch.tensor(0.5))  # DK = e^0.5 ≈ 1.65
+        self.log_DK = nn.Parameter(torch.tensor(-0.5))  # DK = e^(-0.5) ≈ 0.607 < 1（HREE吸附更强）
 
     def get_lambda(self, T_norm, P_norm, R_norm):
         lambda0 = torch.exp(self.log_lambda0).clamp(min=1e-6)
@@ -172,10 +190,13 @@ class PhysicalParams(nn.Module):
         lambda_base = lambda0 * torch.exp(
             bT * T_norm + bP * P_norm + bR * R_norm
         )
-
-        DK = torch.exp(self.log_DK).clamp(min=1.0)
-        lambda_H = lambda_base / torch.sqrt(DK)
-        lambda_L = lambda_base * torch.sqrt(DK)
+        # DK = K_d^L / K_d^H < 1（HREE吸附更强）
+        DK = torch.exp(self.log_DK).clamp(min=0.1)  # 限制DK >= 0.1
+        # DK < 1 → sqrt(DK) < 1
+        # HREE吸附强(λ大) → lambda_H = λ_base / sqrt(DK) > λ_base
+        # LREE吸附弱(λ小) → lambda_L = λ_base * sqrt(DK) < λ_base
+        lambda_H = lambda_base / torch.sqrt(DK)  # HREE吸附强 → λ大
+        lambda_L = lambda_base * torch.sqrt(DK)  # LREE吸附弱 → λ小
 
         return lambda_L, lambda_H
 
@@ -199,6 +220,10 @@ def advect_diffuse_residual(pinn, params, z_norm, clim, C_parent_L, C_parent_H):
     物理损失：
         L_phys = mean[ (dC_L/dz + λ_L · (C_L - C_parent_L))² ]
                 + mean[ (dC_H/dz + λ_H · (C_H - C_parent_H))² ]
+
+    修复2: 自动微分结果除以Z_MAX修正量纲
+        dC/dz_norm = ∂C/∂z_norm
+        dC/dz_phys = (1/Z_MAX) · dC/dz_norm
     """
     z_phys = z_norm.clone().detach().requires_grad_(True)
     clim_phys = clim.clone().detach().requires_grad_(False)
@@ -209,21 +234,25 @@ def advect_diffuse_residual(pinn, params, z_norm, clim, C_parent_L, C_parent_H):
     C = pinn(torch.cat([z_phys, clim_phys], dim=1))
     CL, CH = C[:, 0:1], C[:, 1:2]
 
-    # 自动微分
-    dCL_dz = torch.autograd.grad(
+    # 自动微分（dC/dz_norm）
+    dCL_dz_norm = torch.autograd.grad(
         CL, z_phys, torch.ones_like(CL),
         create_graph=True, retain_graph=True
     )[0]
-    dCH_dz = torch.autograd.grad(
+    dCH_dz_norm = torch.autograd.grad(
         CH, z_phys, torch.ones_like(CH),
         create_graph=True, retain_graph=True
     )[0]
+
+    # 修复2: 修正量纲 - 链式法则 dC/dz_phys = (1/Z_MAX) · dC/dz_norm
+    dCL_dz = dCL_dz_norm / Z_MAX
+    dCH_dz = dCH_dz_norm / Z_MAX
 
     # 气候驱动的 λ
     lambda_L, lambda_H = params.get_lambda(T_n, P_n, R_n)
 
     # 稳态 A-D 约束：dC/dz = -λ · (C - C_parent)
-    # 残差
+    # 残差（使用真实物理量纲）
     Cp_L = C_parent_L + 1e-8
     Cp_H = C_parent_H + 1e-8
 
@@ -271,7 +300,7 @@ class PINFTrainer:
         # (1) 数据损失（按剖面平等）
         loss_data_list = []
         for pid, d in self.profile_data.items():
-            x = torch.cat([d['z'], d['clim']], dim=1).to(self.device)
+            x = torch.cat([d['z'], d['clim_full']], dim=1).to(self.device)
             Cp = self.pinn(x)
             loss_data_list.append(
                 torch.mean((Cp[:, 0:1] - d['CL'].to(self.device)) ** 2)
@@ -285,31 +314,32 @@ class PINFTrainer:
             n_p = n_phys // len(self.profile_data)
             z_phys = (torch.rand(n_p, 1, device=self.device)
                        * d['z'].max().to(self.device))
-            clim_phys = d['clim'].to(self.device)[:1].repeat(n_p, 1)
-            Cp_L = d['CL_parent'].to(self.device).float()
-            Cp_H = d['CH_parent'].to(self.device).float()
+            clim_phys = d['clim_full'].to(self.device)[:1].repeat(n_p, 1)
             lp = advect_diffuse_residual(
-                self.pinn, self.params, z_phys, clim_phys, Cp_L, Cp_H
+                self.pinn, self.params, z_phys, clim_phys,
+                torch.tensor([[d['CL_parent']]]).to(self.device).float(),
+                torch.tensor([[d['CH_parent']]]).to(self.device).float()
             )
             loss_phys_list.append(lp)
         loss_phys = torch.stack(loss_phys_list).mean()
 
-        # (3) 分馏约束（λ_L > λ_H）
+        # (3) 分馏约束（λ_H > λ_L，HREE吸附更强）
         loss_frac = torch.tensor(0.0, device=self.device)
         for pid, d in self.profile_data.items():
-            T_n = d['clim'][:, 0:1].to(self.device)
-            P_n = d['clim'][:, 1:2].to(self.device)
-            R_n = d['clim'][:, 2:3].to(self.device)
+            T_n = d['clim_full'][:, 0:1].to(self.device)
+            P_n = d['clim_full'][:, 1:2].to(self.device)
+            R_n = d['clim_full'][:, 2:3].to(self.device)
             lL, lH = self.params.get_lambda(T_n, P_n, R_n)
-            violation = torch.relu(lH - lL)
+            violation = torch.relu(lL - lH)  # 惩罚 λ_L > λ_H（违反物理约束）
             loss_frac = loss_frac + torch.mean(violation ** 2)
         loss_frac = loss_frac / len(self.profile_data)
 
-        # (4) 边界损失
+        # (4) 边界损失（修复3: 添加 z=z_max 处母岩边界条件）
         loss_bound = torch.tensor(0.0, device=self.device)
         for pid, d in self.profile_data.items():
+            # z=0 处的表层浓度约束
             z0 = torch.zeros(50, 1, device=self.device)
-            clim_bc = d['clim'].to(self.device)[:1].repeat(50, 1)
+            clim_bc = d['clim_full'].to(self.device)[:1].repeat(50, 1)
             C_bc = self.pinn(torch.cat([z0, clim_bc], dim=1))
             loss_bound = loss_bound + torch.mean(
                 (C_bc[:, 0:1] - d['CL_atm'].to(self.device)) ** 2
@@ -317,7 +347,21 @@ class PINFTrainer:
             loss_bound = loss_bound + torch.mean(
                 (C_bc[:, 1:2] - d['CH_atm'].to(self.device)) ** 2
             )
-        loss_bound = loss_bound / len(self.profile_data) / 2
+
+            # 修复3: z=z_max 处的母岩边界条件约束
+            z_max = d['z'].max().to(self.device)
+            z_max_bc = torch.full((50, 1), z_max, device=self.device)
+            clim_bc_max = d['clim_full'].to(self.device)[:1].repeat(50, 1)
+            C_bc_max = self.pinn(torch.cat([z_max_bc, clim_bc_max], dim=1))
+            Cp_L_max = torch.tensor([[d['CL_parent']]]).to(self.device).float()
+            Cp_H_max = torch.tensor([[d['CH_parent']]]).to(self.device).float()
+            loss_bound = loss_bound + torch.mean(
+                (C_bc_max[:, 0:1] - Cp_L_max) ** 2
+            )
+            loss_bound = loss_bound + torch.mean(
+                (C_bc_max[:, 1:2] - Cp_H_max) ** 2
+            )
+        loss_bound = loss_bound / len(self.profile_data) / 4  # 4个边界损失项
 
         # 总损失
         loss = (w_data * loss_data + w_phys * loss_phys
@@ -372,7 +416,6 @@ def main():
     profile_data = {}
     for lid, grp in df.groupby('literature_id'):
         z    = torch.tensor(grp.zn.values, dtype=torch.float32).reshape(-1, 1)
-        c    = torch.tensor(grp[['Tn', 'Pn', 'Rn']].values, dtype=torch.float32)
         CL   = torch.tensor(grp.CL.values, dtype=torch.float32).reshape(-1, 1)
         CH   = torch.tensor(grp.CH.values, dtype=torch.float32).reshape(-1, 1)
         LH   = torch.tensor(grp.LH.values, dtype=torch.float32).reshape(-1, 1)
@@ -383,11 +426,30 @@ def main():
         CL_par = float(grp.CL.iloc[-1])
         CH_par = float(grp.CH.iloc[-1])
 
+        # 修复1: 计算归一化后的母岩和表层浓度特征
+        CL_atm_norm = (CL_atm - CL_ATM_MEAN) / CL_ATM_STD
+        CH_atm_norm = (CH_atm - CH_ATM_MEAN) / CH_ATM_STD
+        CL_par_norm = (CL_par - CL_PAR_MEAN) / CL_PAR_STD
+        CH_par_norm = (CH_par - CH_PAR_MEAN) / CH_PAR_STD
+
+        # 气候特征（4维）
+        clim = torch.tensor(grp[['Tn', 'Pn', 'Rn']].values, dtype=torch.float32)
+
+        # 修复1: 完整输入特征（8维）: [z_norm, T, P, R, CL_parent_norm, CH_parent_norm, CL_atm_norm, CH_atm_norm]
+        # 注意：这里只存储气候+母岩/表层浓度，不含z（z在构建输入时单独拼接）
+        clim_full = torch.cat([
+            clim,
+            torch.tensor([[CL_par_norm, CH_par_norm, CL_atm_norm, CH_atm_norm]]).repeat(len(grp), 1)
+        ], dim=1)
+
         profile_data[int(lid)] = {
-            'z': z, 'clim': c, 'CL': CL, 'CH': CH, 'LH': LH,
+            'z': z, 'clim': clim, 'clim_full': clim_full,
+            'CL': CL, 'CH': CH, 'LH': LH,
             'CL_atm': torch.tensor([[CL_atm]]),
             'CH_atm': torch.tensor([[CH_atm]]),
             'CL_parent': CL_par, 'CH_parent': CH_par,
+            'CL_atm_norm': CL_atm_norm, 'CH_atm_norm': CH_atm_norm,
+            'CL_parent_norm': CL_par_norm, 'CH_parent_norm': CH_par_norm,
             'name': f"[{int(lid)}] {grp.parent_rock.iloc[0][:18]}",
             'T_C': grp.T_annual_mean_K.iloc[0] - 273.15,
             'P_mm': grp.P_annual_mean_mm_yr.iloc[0],
@@ -395,6 +457,10 @@ def main():
             'Tn_mean': float(grp['Tn'].mean()),
             'Pn_mean': float(grp['Pn'].mean()),
             'Rn_mean': float(grp['Rn'].mean()),
+            'CL_atm_mean': CL_atm_norm,
+            'CH_atm_mean': CH_atm_norm,
+            'CL_par_mean': CL_par_norm,
+            'CH_par_mean': CH_par_norm,
         }
 
     print(f'\n{len(df)} samples, {len(profile_data)} profiles')
@@ -406,7 +472,7 @@ def main():
               f"LH_atm={LH_atm:.1f}  LH_parent={LH_par:.1f}")
 
     device = torch.device('cpu')
-    pinn   = REE_PINF(64, 5).to(device)
+    pinn   = REE_PINF(16, 3).to(device)
     params = PhysicalParams().to(device)
     tr     = PINFTrainer(pinn, params, profile_data)
 
@@ -431,7 +497,7 @@ def main():
     pinn.eval()
     results = {}
     for pid, d in profile_data.items():
-        x = torch.cat([d['z'], d['clim']], dim=1)
+        x = torch.cat([d['z'], d['clim_full']], dim=1)
         with torch.no_grad():
             Cp = pinn(x).numpy()
         CL_obs = d['CL'].numpy().ravel()
@@ -499,9 +565,13 @@ def plot(pinn, params, profile_data, results, H, save_dir):
 
         # 预测曲线（平滑）
         Ta, Pa, Ra = d['Tn_mean'], d['Pn_mean'], d['Rn_mean']
+        # 修复1: 使用完整8维输入
+        extra = torch.tensor([[d['CL_par_mean'], d['CH_par_mean'],
+                               d['CL_atm_mean'], d['CH_atm_mean']]])
+        clim_full = torch.cat([torch.tensor([[Ta, Pa, Ra]]), extra], dim=1)
         zv = np.linspace(0, float(d['z'].max()) * Z_MAX, 200)
         zn = torch.tensor(zv / Z_MAX, dtype=torch.float32).reshape(-1, 1)
-        clim = torch.tensor([[Ta, Pa, Ra]] * len(zv), dtype=torch.float32)
+        clim = clim_full.repeat(len(zv), 1).float()
         with torch.no_grad():
             Cp = pinn(torch.cat([zn, clim], dim=1)).numpy()
         LH_curve = Cp[:, 0] / (Cp[:, 1] + 1e-6)
@@ -526,9 +596,12 @@ def plot(pinn, params, profile_data, results, H, save_dir):
     for idx, pid in enumerate(sorted(profile_data.keys())):
         d = profile_data[pid]; r = results[pid]
         Ta, Pa, Ra = d['Tn_mean'], d['Pn_mean'], d['Rn_mean']
+        extra = torch.tensor([[d['CL_par_mean'], d['CH_par_mean'],
+                               d['CL_atm_mean'], d['CH_atm_mean']]])
+        clim_full = torch.cat([torch.tensor([[Ta, Pa, Ra]]), extra], dim=1)
         zv = np.linspace(0, float(d['z'].max()) * Z_MAX, 200)
         zn = torch.tensor(zv / Z_MAX, dtype=torch.float32).reshape(-1, 1)
-        clim = torch.tensor([[Ta, Pa, Ra]] * len(zv), dtype=torch.float32)
+        clim = clim_full.repeat(len(zv), 1).float()
         with torch.no_grad():
             Cp = pinn(torch.cat([zn, clim], dim=1)).numpy()
         LH_curve = Cp[:, 0] / (Cp[:, 1] + 1e-6)
@@ -547,13 +620,20 @@ def plot(pinn, params, profile_data, results, H, save_dir):
     T_mean_phys = np.mean([d['Tn_mean'] for d in profile_data.values()])
     P_mean_phys = np.mean([d['Pn_mean'] for d in profile_data.values()])
     R_mean_phys = np.mean([d['Rn_mean'] for d in profile_data.values()])
+    # 使用所有剖面母岩/表层浓度的均值
+    CL_par_mean_all = np.mean([d['CL_par_mean'] for d in profile_data.values()])
+    CH_par_mean_all = np.mean([d['CH_par_mean'] for d in profile_data.values()])
+    CL_atm_mean_all = np.mean([d['CL_atm_mean'] for d in profile_data.values()])
+    CH_atm_mean_all = np.mean([d['CH_atm_mean'] for d in profile_data.values()])
+    extra_mean = torch.tensor([[CL_par_mean_all, CH_par_mean_all,
+                                 CL_atm_mean_all, CH_atm_mean_all]])
     zv = np.linspace(0, Z_MAX, 200)
     zn_base = torch.tensor(zv / Z_MAX, dtype=torch.float32).reshape(-1, 1)
 
     for delta_T in [-1.5, -0.5, 0.0, 0.5, 1.5]:
         T_n = T_mean_phys + delta_T
-        clim = torch.tensor([[T_n, P_mean_phys, R_mean_phys]] * len(zv),
-                           dtype=torch.float32)
+        clim_base = torch.tensor([[T_n, P_mean_phys, R_mean_phys]]).repeat(len(zv), 1)
+        clim = torch.cat([clim_base, extra_mean.repeat(len(zv), 1)], dim=1).float()
         with torch.no_grad():
             Cp = pinn(torch.cat([zn_base, clim], dim=1)).numpy()
         LH_c = Cp[:, 0] / (Cp[:, 1] + 1e-6)
@@ -571,8 +651,8 @@ def plot(pinn, params, profile_data, results, H, save_dir):
     ax = fig.add_subplot(gs[3, 2])
     for delta_P in [-1.0, -0.5, 0.0, 0.5, 1.0]:
         P_n = P_mean_phys + delta_P
-        clim = torch.tensor([[T_mean_phys, P_n, R_mean_phys]] * len(zv),
-                           dtype=torch.float32)
+        clim_base = torch.tensor([[T_mean_phys, P_n, R_mean_phys]]).repeat(len(zv), 1)
+        clim = torch.cat([clim_base, extra_mean.repeat(len(zv), 1)], dim=1).float()
         with torch.no_grad():
             Cp = pinn(torch.cat([zn_base, clim], dim=1)).numpy()
         LH_c = Cp[:, 0] / (Cp[:, 1] + 1e-6)
@@ -602,13 +682,15 @@ def plot(pinn, params, profile_data, results, H, save_dir):
     ax.set_title('Climate Sensitivity Coefficients'); ax.legend(); ax.grid(alpha=0.3)
 
     ax = fig.add_subplot(gs[4, 2])
-    ax.plot(steps, np.array(H['DK'])[::20], lw=1.5, label='DK = K_d^L / K_d^H',
+    # 修复4: 修正打印文本 λ_H/λ_L = 1/DK
+    final_DK = H['DK'][-1]
+    ax.plot(steps, np.array(H['DK'])[::20], lw=1.5, label='DK = K_d^L / K_d^H (< 1, HREE adsorbs more)',
             color='purple')
     ax.axhline(1.0, color='gray', ls='--', lw=1)
     ax.set_xlabel('Iteration'); ax.set_ylabel('DK')
     ax.set_title(f'L/H Fractionation Strength (DK)\n'
-                 f'Final DK = {H["DK"][-1]:.3f}  '
-                 f'→ λ_L/λ_H = sqrt(DK) = {np.sqrt(H["DK"][-1]):.3f}')
+                 f'Final DK = {final_DK:.3f}  '
+                 f'→ λ_H/λ_L = 1/DK = {1/final_DK:.3f}')
     ax.legend(); ax.grid(alpha=0.3)
 
     l0 = H['lambda0'][-1]
@@ -617,9 +699,10 @@ def plot(pinn, params, profile_data, results, H, save_dir):
     bP = H['bP'][-1]
     bR = H['bR'][-1]
 
+    # 修复4: 修正标题中的 λ_H/λ_L = 1/DK
     plt.suptitle(
         f'REE PINF v15 — 物理化学框架\n'
-        f'lambda0={l0:.4f} m⁻¹  DK={DK:.3f} (lambda_L/lambda_H={np.sqrt(DK):.3f})\n'
+        f'lambda0={l0:.4f} m⁻¹  DK={DK:.3f} (λ_H/λ_L = 1/DK = {1/DK:.3f})\n'
         f'bT={bT:+.3f}  bP={bP:+.3f}  bR={bR:+.3f}\n'
         f'物理：A-D方程 + 吸附阻滞 + 气候响应 | 展示：拟合 + 敏感性分析',
         fontsize=12
